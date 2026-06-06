@@ -1,0 +1,373 @@
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { RefreshCw, AlertTriangle } from "lucide-react";
+
+/* ---------------------------------- Universo ---------------------------------- */
+const GROUPS = [
+  { label: "Globales", items: [
+    { t: "URTH", n: "Desarrollados" }, { t: "EEM", n: "Emergentes" }, { t: "ACWI", n: "Globales" },
+  ]},
+  { label: "Estados Unidos", items: [
+    { t: "SPY", n: "S&P 500" }, { t: "DIA", n: "Dow Jones" }, { t: "QQQ", n: "Nasdaq" },
+  ]},
+  { label: "Europa", items: [
+    { t: "IEV", n: "Europa" }, { t: "EWP", n: "España" }, { t: "EWU", n: "Reino Unido" },
+    { t: "EWG", n: "Alemania" }, { t: "EWQ", n: "Francia" }, { t: "EWI", n: "Italia" },
+  ]},
+  { label: "Asia Desarrollada", items: [
+    { t: "EWJ", n: "Japón" }, { t: "EWA", n: "Australia" }, { t: "EWH", n: "Hong Kong" },
+  ]},
+  { label: "Asia Emergente", items: [
+    { t: "AAXJ", n: "Asia Emergente" }, { t: "FXI", n: "China" }, { t: "INDA", n: "India" },
+    { t: "EWY", n: "Corea" }, { t: "EWT", n: "Taiwán" },
+  ]},
+  { label: "Latinoamérica", items: [
+    { t: "ILF", n: "Latam" }, { t: "^IPSA", n: "Chile", clp: true }, { t: "EWZ", n: "Brasil" }, { t: "EWW", n: "México" },
+  ]},
+  { label: "Dólar y Materias Primas", items: [
+    { t: "DX-Y.NYB", n: "Dollar Index", native: true, u: "pts" },
+    { t: "USDCLP=X", n: "USD/CLP", native: true, u: "$" },
+    { t: "HG=F", n: "Cobre", native: true, u: "US$/lb" },
+  ]},
+];
+const ALL_TICKERS = GROUPS.flatMap((g) => g.items.map((i) => i.t));
+
+/* ---------------------------------- Fetching ---------------------------------- */
+const PROXIES = [
+  (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}`,
+  (u) => `https://thingproxy.freeboard.io/fetch/${u}`,
+];
+
+async function fetchYahoo(ticker) {
+  const yurl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=10y&interval=1d`;
+  for (const make of PROXIES) {
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 13000);
+      const res = await fetch(make(yurl), { signal: ctrl.signal });
+      clearTimeout(to);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const r = data?.chart?.result?.[0];
+      if (!r?.timestamp) continue;
+      const ts = r.timestamp;
+      const closeArr = r.indicators?.quote?.[0]?.close;
+      const adjArr = r.indicators?.adjclose?.[0]?.adjclose;
+      if (!closeArr) continue;
+      const adj = [], close = [];
+      for (let i = 0; i < ts.length; i++) {
+        const d = new Date(ts[i] * 1000);
+        const c = closeArr[i];
+        const a = adjArr && adjArr[i] != null ? adjArr[i] : c;
+        if (c != null) close.push({ t: d, c });
+        if (a != null) adj.push({ t: d, c: a });
+      }
+      adj.sort((x, y) => x.t - y.t);
+      close.sort((x, y) => x.t - y.t);
+      if (close.length) return { adj, close };
+    } catch (e) { /* siguiente proxy */ }
+  }
+  throw new Error("fail " + ticker);
+}
+
+async function fetchAll(onProgress) {
+  const store = {}, failed = [];
+  const batch = 4;
+  for (let i = 0; i < ALL_TICKERS.length; i += batch) {
+    const slice = ALL_TICKERS.slice(i, i + batch);
+    const results = await Promise.allSettled(slice.map((t) => fetchYahoo(t)));
+    results.forEach((res, idx) => {
+      const t = slice[idx];
+      if (res.status === "fulfilled") store[t] = res.value;
+      else failed.push(t);
+    });
+    onProgress(Math.min(ALL_TICKERS.length, i + batch));
+  }
+  return { store, failed };
+}
+
+/* ---------------------------------- Búsquedas ---------------------------------- */
+function onOrBefore(series, date) {
+  const target = date.getTime();
+  let lo = 0, hi = series.length - 1, ans = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (series[mid].t.getTime() <= target) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+  return ans < 0 ? null : series[ans];
+}
+function onOrAfter(series, date) {
+  const target = date.getTime();
+  let lo = 0, hi = series.length - 1, ans = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (series[mid].t.getTime() >= target) { ans = mid; hi = mid - 1; } else lo = mid + 1; }
+  return ans < 0 ? null : series[ans];
+}
+function makeLookup(series) {
+  return function (date) {
+    const p = onOrBefore(series, date);
+    return p ? p.c : series.length ? series[0].c : null;
+  };
+}
+
+/* --------------------------- Serie según moneda --------------------------- */
+function seriesForCurrency(item, store, usd, currency) {
+  const raw = store[item.t];
+  if (!raw) return null;
+  const closeLast = raw.close[raw.close.length - 1];
+  if (item.native) return { adj: raw.adj, last: closeLast.c };
+  if (item.clp) { // ^IPSA nativo en CLP
+    if (currency === "CLP") return { adj: raw.adj, last: closeLast.c };
+    if (!usd) return null;
+    const adj = raw.adj.map((p) => ({ t: p.t, c: p.c / usd(p.t) }));
+    return { adj, last: closeLast.c / usd(closeLast.t) };
+  }
+  // ETF denominado en USD
+  if (currency === "USD") return { adj: raw.adj, last: closeLast.c };
+  if (!usd) return null;
+  const adj = raw.adj.map((p) => ({ t: p.t, c: p.c * usd(p.t) }));
+  return { adj, last: closeLast.c * usd(closeLast.t) };
+}
+
+const YEAR_MS = 365.25 * 86400000;
+function computeMetrics(adj, cStart, cEnd) {
+  if (!adj || adj.length < 2) return {};
+  const last = adj[adj.length - 1];
+  const ld = last.t;
+  const m = {};
+  // Semanal viernes a viernes
+  const fri = adj.filter((p) => p.t.getUTCDay() === 5);
+  m.wk = fri.length >= 2 ? last.c / fri[fri.length - (fri[fri.length - 1].t.getTime() === ld.getTime() ? 2 : 2)].c - 1 : null;
+  if (fri.length >= 2) m.wk = fri[fri.length - 1].c / fri[fri.length - 2].c - 1;
+  // MTD
+  const mtdRef = onOrBefore(adj, new Date(Date.UTC(ld.getUTCFullYear(), ld.getUTCMonth(), 0)));
+  m.mtd = mtdRef ? last.c / mtdRef.c - 1 : null;
+  // YTD
+  const ytdRef = onOrBefore(adj, new Date(Date.UTC(ld.getUTCFullYear(), 0, 0)));
+  m.ytd = ytdRef ? last.c / ytdRef.c - 1 : null;
+  // 12m
+  const r12 = onOrBefore(adj, new Date(Date.UTC(ld.getUTCFullYear() - 1, ld.getUTCMonth(), ld.getUTCDate())));
+  m.y1 = r12 ? last.c / r12.c - 1 : null;
+  // 3 años anualizado
+  const r3 = onOrBefore(adj, new Date(Date.UTC(ld.getUTCFullYear() - 3, ld.getUTCMonth(), ld.getUTCDate())));
+  if (r3) { const yrs = (last.t - r3.t) / YEAR_MS; m.y3 = Math.pow(last.c / r3.c, 1 / yrs) - 1; }
+  // 5 años anualizado
+  const r5 = onOrBefore(adj, new Date(Date.UTC(ld.getUTCFullYear() - 5, ld.getUTCMonth(), ld.getUTCDate())));
+  if (r5) { const yrs = (last.t - r5.t) / YEAR_MS; m.y5 = Math.pow(last.c / r5.c, 1 / yrs) - 1; }
+  // Personalizado
+  if (cStart && cEnd && cEnd > cStart) {
+    const s = onOrAfter(adj, cStart);
+    const e = onOrBefore(adj, cEnd);
+    if (s && e && e.t > s.t) {
+      m.cum = e.c / s.c - 1;
+      const yrs = (e.t - s.t) / YEAR_MS;
+      m.cumAnn = yrs >= 1 ? Math.pow(e.c / s.c, 1 / yrs) - 1 : null;
+    }
+  }
+  return m;
+}
+
+/* ---------------------------------- Formato ---------------------------------- */
+const nf2 = new Intl.NumberFormat("es-CL", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtVal = (x) => (x == null || !isFinite(x) ? "—" : nf2.format(x));
+const fmtPct = (x) => {
+  if (x == null || !isFinite(x)) return "—";
+  const v = x * 100;
+  return (v > 0 ? "+" : "") + nf2.format(v) + "%";
+};
+const pctCls = (x) => {
+  if (x == null || !isFinite(x)) return "text-slate-300";
+  if (x > 0.00005) return "text-emerald-600";
+  if (x < -0.00005) return "text-rose-600";
+  return "text-slate-400";
+};
+
+/* ---------------------------------- Componente ---------------------------------- */
+export default function App() {
+  const [store, setStore] = useState({});
+  const [failed, setFailed] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [progress, setProgress] = useState(0);
+  const [currency, setCurrency] = useState("USD");
+
+  const today = new Date();
+  const isoToday = today.toISOString().slice(0, 10);
+  const isoYearStart = `${today.getUTCFullYear()}-01-01`;
+  const [cStartStr, setCStartStr] = useState(isoYearStart);
+  const [cEndStr, setCEndStr] = useState(isoToday);
+
+  const load = useCallback(async () => {
+    setLoading(true); setProgress(0);
+    try {
+      const { store, failed } = await fetchAll(setProgress);
+      setStore(store); setFailed(failed);
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const usd = useMemo(() => {
+    const s = store["USDCLP=X"]?.close;
+    return s && s.length ? makeLookup(s) : null;
+  }, [store]);
+
+  const clpUnavailable = currency === "CLP" && !usd;
+
+  const cStart = useMemo(() => new Date(cStartStr + "T00:00:00Z"), [cStartStr]);
+  const cEnd = useMemo(() => new Date(cEndStr + "T23:59:59Z"), [cEndStr]);
+
+  const latestDate = useMemo(() => {
+    let max = null;
+    Object.values(store).forEach((r) => {
+      const d = r.close[r.close.length - 1]?.t;
+      if (d && (!max || d > max)) max = d;
+    });
+    return max;
+  }, [store]);
+
+  const rows = useMemo(() => {
+    const effCur = clpUnavailable ? "USD" : currency;
+    return GROUPS.map((g) => ({
+      label: g.label,
+      items: g.items.map((it) => {
+        const s = seriesForCurrency(it, store, usd, effCur);
+        const m = s ? computeMetrics(s.adj, cStart, cEnd) : {};
+        return { ...it, last: s?.last ?? null, ok: !!s, m };
+      }),
+    }));
+  }, [store, usd, currency, clpUnavailable, cStart, cEnd]);
+
+  const COLS = [
+    { k: "wk", h: "Sem." }, { k: "mtd", h: "MTD" }, { k: "ytd", h: "YTD" },
+    { k: "y1", h: "12m" }, { k: "y3", h: "3a*" }, { k: "y5", h: "5a*" },
+  ];
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4 text-slate-800" style={{ fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      <div className="mx-auto max-w-6xl overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+
+        {/* Encabezado */}
+        <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-900 px-5 py-4">
+          <div>
+            <h1 className="text-base font-semibold tracking-tight text-white">Panel de Rentabilidades por Región</h1>
+            <p className="text-xs text-slate-400">Visión de mercado para asesoría · ETFs e índices por zona geográfica</p>
+          </div>
+          <div className="text-right">
+            <p className="text-[11px] uppercase tracking-wider text-slate-500">Datos al</p>
+            <p className="text-sm font-medium text-slate-200">
+              {latestDate ? latestDate.toLocaleDateString("es-CL", { day: "2-digit", month: "2-digit", year: "numeric" }) : "—"}
+            </p>
+          </div>
+        </div>
+
+        {/* Barra de controles */}
+        <div className="flex flex-wrap items-end gap-4 border-b border-slate-200 bg-white px-5 py-3">
+          <div>
+            <label className="mb-1 block text-[11px] font-medium uppercase tracking-wider text-slate-400">Moneda</label>
+            <div className="inline-flex overflow-hidden rounded-md border border-slate-300">
+              {["USD", "CLP"].map((c) => (
+                <button key={c} onClick={() => setCurrency(c)}
+                  className={`px-3.5 py-1.5 text-sm font-medium transition-colors ${currency === c ? "bg-slate-900 text-white" : "bg-white text-slate-600 hover:bg-slate-100"}`}>
+                  {c}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="h-9 w-px self-end bg-slate-200" />
+
+          <div>
+            <label className="mb-1 block text-[11px] font-medium uppercase tracking-wider text-slate-400">Inicio (Pers.)</label>
+            <input type="date" value={cStartStr} max={cEndStr} onChange={(e) => setCStartStr(e.target.value)}
+              className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-700 focus:border-slate-500 focus:outline-none" />
+          </div>
+          <div>
+            <label className="mb-1 block text-[11px] font-medium uppercase tracking-wider text-slate-400">Fin (Pers.)</label>
+            <input type="date" value={cEndStr} min={cStartStr} max={isoToday} onChange={(e) => setCEndStr(e.target.value)}
+              className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-700 focus:border-slate-500 focus:outline-none" />
+          </div>
+
+          <div className="ml-auto">
+            <button onClick={load} disabled={loading}
+              className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-3.5 py-1.5 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-100 disabled:opacity-50">
+              <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
+              {loading ? `Cargando ${progress}/${ALL_TICKERS.length}` : "Actualizar"}
+            </button>
+          </div>
+        </div>
+
+        {/* Avisos */}
+        {clpUnavailable && (
+          <div className="flex items-center gap-2 border-b border-amber-200 bg-amber-50 px-5 py-2 text-xs text-amber-800">
+            <AlertTriangle size={14} /> No se pudo cargar USD/CLP; la vista en CLP no está disponible. Mostrando USD.
+          </div>
+        )}
+        {!loading && failed.length > 0 && (
+          <div className="flex items-center gap-2 border-b border-amber-200 bg-amber-50 px-5 py-2 text-xs text-amber-800">
+            <AlertTriangle size={14} /> No cargaron {failed.length} instrumento(s): {failed.join(", ")}. Reintenta con “Actualizar”.
+          </div>
+        )}
+
+        {/* Tabla */}
+        <div className="overflow-x-auto">
+          {loading && Object.keys(store).length === 0 ? (
+            <div className="flex flex-col items-center justify-center gap-3 py-20 text-slate-400">
+              <RefreshCw size={22} className="animate-spin" />
+              <p className="text-sm">Cargando datos de mercado… {progress}/{ALL_TICKERS.length}</p>
+            </div>
+          ) : (
+            <table className="w-full min-w-[920px] text-sm">
+              <thead>
+                <tr className="bg-slate-100 text-[11px] uppercase tracking-wider text-slate-500">
+                  <th className="px-4 py-2.5 text-left font-semibold">Instrumento</th>
+                  <th className="px-3 py-2.5 text-right font-semibold">Último ({currency === "CLP" && !clpUnavailable ? "CLP" : "USD"})</th>
+                  {COLS.map((c) => <th key={c.k} className="px-3 py-2.5 text-right font-semibold">{c.h}</th>)}
+                  <th className="px-3 py-2.5 text-right font-semibold">Pers.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((g) => (
+                  <>
+                    <tr key={g.label}>
+                      <td colSpan={9} className="bg-slate-800 px-4 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-100">
+                        {g.label}
+                      </td>
+                    </tr>
+                    {g.items.map((it) => (
+                      <tr key={it.t} className="border-b border-slate-100 transition-colors hover:bg-slate-50">
+                        <td className="px-4 py-2">
+                          <div className="flex flex-col leading-tight">
+                            <span className="text-slate-800">{it.n}</span>
+                            <span className="font-mono text-[11px] text-slate-400">
+                              {it.t}{it.native && it.u ? ` · ${it.u}` : ""}{it.clp ? " · CLP" : ""}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-right font-medium tabular-nums text-slate-900">{fmtVal(it.last)}</td>
+                        {COLS.map((c) => (
+                          <td key={c.k} className={`px-3 py-2 text-right tabular-nums ${pctCls(it.m[c.k])}`}>{fmtPct(it.m[c.k])}</td>
+                        ))}
+                        <td className={`px-3 py-2 text-right tabular-nums ${pctCls(it.m.cum)}`}>
+                          <div className="flex flex-col leading-tight">
+                            <span>{fmtPct(it.m.cum)}</span>
+                            {it.m.cumAnn != null && (
+                              <span className="text-[10px] font-normal text-slate-400">anualiz. {fmtPct(it.m.cumAnn)}</span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Notas */}
+        <div className="space-y-1 border-t border-slate-200 bg-slate-50 px-5 py-3 text-[11px] leading-relaxed text-slate-400">
+          <p><span className="font-medium text-slate-500">*</span> 3a y 5a anualizados. <span className="font-medium text-slate-500">Sem.</span> = cierre del último viernes vs. viernes previo. <span className="font-medium text-slate-500">MTD/YTD</span> desde el último cierre del mes/año anterior.</p>
+          <p>Rentabilidades calculadas sobre <span className="font-medium text-slate-500">precio ajustado</span> (dividendos reinvertidos). La columna “Último” muestra el precio de cierre de mercado. Conversión a CLP punto a punto con el USD/CLP de cada fecha.</p>
+          <p>El bloque Dólar/Cobre se muestra siempre en unidades nativas (índice, $ por dólar, US$/lb). ^IPSA es nativo en CLP; su vista USD se obtiene dividiendo por USD/CLP. Fuente: Yahoo Finance.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
