@@ -1,55 +1,42 @@
 """
-Panel de Rentabilidades por Región
------------------------------------
-Descarga precios y genera un HTML autocontenido e interactivo:
-toggle USD/CLP + selector de fechas + bullets de mercado al pie.
-Todo se recalcula en el navegador desde datos incrustados (sin internet).
-
-Fuentes:
-  - ^IPSA, DX-Y.NYB, USDCLP=X, HG=F  -> Investing.com (primario), yfinance (respaldo)
-  - resto de ETFs                    -> yfinance
-
-Conversion CLP (aditiva): retorno_CLP = retorno_USD + variacion_USDCLP.
-IPSA, Dollar Index, Cobre y USD/CLP NO se ajustan por tipo de cambio.
+Panel de Rentabilidades por Región  (v2)
+-----------------------------------------
+- ETFs: Yahoo Finance (precio ajustado = total return).
+- IPSA, Dollar Index, USD/CLP y Cobre: Investing.com (con respaldo en Yahoo).
+- Conversion a CLP por metodo ADITIVO: retorno USD + variacion USD/CLP.
+- IPSA nativo en CLP (sin ajuste por tipo de cambio).
+- Genera HTML autocontenido e interactivo (toggle USD/CLP + fechas) y un
+  "Comentario de mercado" con bullets semanales al pie.
 
 Uso (Windows):
-    pip install yfinance pandas numpy cloudscraper lxml pytz
+    pip install yfinance pandas cloudscraper lxml pytz
     python panel_rentabilidades.py
 """
 import json
 import sys
 import time
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from random import randint
 
 try:
-    import numpy as np
-    import pandas as pd
     import yfinance as yf
+    import pandas as pd
 except ImportError:
-    print("Faltan dependencias. Ejecuta:  pip install yfinance pandas numpy cloudscraper lxml pytz")
+    print("Faltan dependencias base. Ejecuta:  pip install yfinance pandas")
     sys.exit(1)
 
-# Dependencias opcionales para Investing (si faltan, se usa solo yfinance)
 try:
-    import cloudscraper as _cs
+    import cloudscraper
+    from lxml.html import fromstring as lxml_fromstring
+    import pytz
+    HAVE_INVESTING = True
 except ImportError:
-    _cs = None
-try:
-    from lxml.html import fromstring as _lxml
-except ImportError:
-    _lxml = None
-try:
-    import pytz as _pytz
-except ImportError:
-    _pytz = None
+    HAVE_INVESTING = False
 
-import warnings
-warnings.filterwarnings("ignore")
-
-# ----------------------------- Configuracion ---------------------------------
-PERIOD_DAYS = 3660          # ~10 anios de historia
-INVESTING_MIN_ROWS = 100    # si Investing devuelve menos filas, usa yfinance
+# ----------------------------- Configuración ---------------------------------
+PERIOD = "10y"
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
 GROUPS = [
     {"label": "Globales", "items": [
@@ -81,229 +68,232 @@ GROUPS = [
 ]
 ALL = [it["t"] for g in GROUPS for it in g["items"]]
 
-INVESTING_TICKERS = ["^IPSA", "DX-Y.NYB", "USDCLP=X", "HG=F"]
+# Instrumentos que se bajan de Investing.com (curr_id, header, slug-referer)
 INVESTING_SOURCES = {
-    "^IPSA":    ("14767",  "S&P CLX IPSA Historical Data",   "indices/ipsa-historical-data"),
+    "^IPSA":    ("14767",  "S&P CLX IPSA Historical Data",    "indices/ipsa-historical-data"),
     "DX-Y.NYB": ("942611", "US Dollar Index Historical Data", "indices/usdollar-historical-data"),
     "USDCLP=X": ("2110",   "USD/CLP Historical Data",         "currencies/usd-clp-historical-data"),
     "HG=F":     ("8831",   "Copper Futures Historical Data",  "commodities/copper"),
 }
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
 
-# ----------------------------- Investing.com ---------------------------------
+# ----------------------------- Utilidades fechas ------------------------------
+def to_sec(d):
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+
+
+def last_friday(ref=None):
+    if ref is None:
+        ref = date.today()
+    return ref - timedelta(days=(ref.weekday() - 4) % 7)
+
+
+# ----------------------------- Descarga Yahoo (base) --------------------------
+print(f"Descargando {len(ALL)} instrumentos desde Yahoo Finance ({PERIOD})...")
+yahoo = yf.download(ALL, period=PERIOD, interval="1d", auto_adjust=False,
+                    group_by="ticker", threads=True, progress=False)
+
+
+def extract_yahoo(tk):
+    try:
+        df = yahoo[tk]
+    except Exception:
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    cols = df.columns
+    acol = "Adj Close" if "Adj Close" in cols else ("Close" if "Close" in cols else None)
+    if acol is None:
+        return None
+    ta, adj, tc, close = [], [], [], []
+    for ts, row in df.iterrows():
+        sec = to_sec(ts)
+        a = row.get(acol)
+        c = row.get("Close") if "Close" in cols else a
+        if pd.notna(a):
+            ta.append(sec); adj.append(round(float(a), 4))
+        if pd.notna(c):
+            tc.append(sec); close.append(round(float(c), 4))
+    if not ta and not tc:
+        return None
+    return {"ta": ta, "adj": adj, "tc": tc, "close": close}
+
+
+# ----------------------------- Descarga Investing -----------------------------
 def fetch_investing(ticker, start, end):
-    if _cs is None or _lxml is None or _pytz is None:
+    if not HAVE_INVESTING:
         return None
     curr_id, header, slug = INVESTING_SOURCES[ticker]
-    scraper = _cs.create_scraper()
+    scraper = cloudscraper.create_scraper()
     params = {
-        "curr_id": curr_id, "smlID": str(randint(1000000, 9999999)),
-        "header": header, "st_date": start.strftime("%m/%d/%Y"),
-        "end_date": (end + timedelta(days=2)).strftime("%m/%d/%Y"),
-        "interval_sec": "Daily", "sort_col": "date", "sort_ord": "DESC",
+        "curr_id": curr_id,
+        "smlID": str(randint(1_000_000, 9_999_999)),
+        "header": header,
+        "st_date": start.strftime("%m/%d/%Y"),
+        "end_date": (end + timedelta(days=5)).strftime("%m/%d/%Y"),
+        "interval_sec": "Daily",
+        "sort_col": "date",
+        "sort_ord": "DESC",
         "action": "historical_data",
     }
     headers = {
-        "User-Agent": _UA, "X-Requested-With": "XMLHttpRequest",
-        "Accept": "text/html", "Origin": "https://www.investing.com",
+        "User-Agent": USER_AGENT,
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "text/html",
         "Referer": f"https://www.investing.com/{slug}",
+        "Origin": "https://www.investing.com",
     }
-    r = None
     for attempt in range(3):
         try:
             r = scraper.post("https://www.investing.com/instruments/HistoricalDataAjax",
-                             headers=headers, data=params, timeout=20)
-            if r.status_code == 200:
-                break
+                             headers=headers, data=params, timeout=25)
+            if r.status_code != 200:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                continue
+            root = lxml_fromstring(r.content)
+            rows = root.xpath('.//table[@id="curr_table"]/tbody/tr')
+            recs = {}
+            for row in rows:
+                tds = row.xpath(".//td")
+                if not tds:
+                    continue
+                raw_ts = tds[0].get("data-real-value")
+                raw_close = tds[1].get("data-real-value")
+                if not raw_ts or not raw_close:
+                    continue
+                d = datetime.fromtimestamp(int(raw_ts), tz=pytz.UTC).date()
+                recs[d] = float(raw_close.replace(",", ""))
+            if recs:
+                return recs
         except Exception:
-            r = None
-        time.sleep(2 ** attempt)
-    if r is None or r.status_code != 200:
-        return None
-    try:
-        root = _lxml(r.content)
-        rows = root.xpath('.//table[@id="curr_table"]/tbody/tr')
-        rec = {}
-        for row in rows:
-            tds = row.xpath(".//td")
-            if len(tds) < 2:
-                continue
-            raw_ts, raw_close = tds[0].get("data-real-value"), tds[1].get("data-real-value")
-            if not raw_ts or not raw_close:
-                continue
-            d = datetime.fromtimestamp(int(raw_ts), tz=_pytz.UTC).date()
-            rec[d] = float(raw_close.replace(",", ""))
-        if not rec:
-            return None
-        idx = pd.to_datetime(sorted(rec.keys()))
-        return pd.Series([rec[d.date()] for d in idx], index=idx, name="Close")
-    except Exception:
-        return None
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return None
 
 
-# ----------------------------- yfinance ---------------------------------------
-def _df_for(batch, t):
-    try:
-        if isinstance(batch.columns, pd.MultiIndex):
-            return batch[t]
-        return batch
-    except Exception:
-        return None
+def recs_to_arrays(recs):
+    ds = sorted(recs.keys())
+    ta = [to_sec(d) for d in ds]
+    vs = [round(float(recs[d]), 4) for d in ds]
+    return {"ta": ta, "adj": vs, "tc": list(ta), "close": list(vs)}
 
 
-def _extract(df):
-    """Devuelve (adj_series, close_series) o (None, None)."""
-    if df is None or getattr(df, "empty", True):
-        return None, None
-    cols = df.columns
-    if "Close" not in cols and "Adj Close" not in cols:
-        return None, None
-    close = df["Close"].dropna() if "Close" in cols else df["Adj Close"].dropna()
-    adj = df["Adj Close"].dropna() if "Adj Close" in cols else close
-    for s in (close, adj):
-        if getattr(s.index, "tz", None) is not None:
-            s.index = s.index.tz_localize(None)
-    return adj, close
+# ----------------------------- Construir DATA ---------------------------------
+DATA, failed = {}, []
+for tk in ALL:
+    d = extract_yahoo(tk)
+    if d:
+        DATA[tk] = d
+    else:
+        failed.append(tk)
+
+START = date.today() - timedelta(days=3660)  # ~10 años
+inv_ok, inv_fb = [], []
+for tk in INVESTING_SOURCES:
+    recs = fetch_investing(tk, START, date.today())
+    if recs:
+        DATA[tk] = recs_to_arrays(recs)
+        inv_ok.append(tk)
+    else:
+        inv_fb.append(tk)
+
+if not HAVE_INVESTING:
+    print("  [!] Investing deshabilitado (faltan libs). Esos 4 usan Yahoo.")
+    print("      Para activarlo: pip install cloudscraper lxml pytz")
+if inv_ok:
+    print("  Investing.com OK: " + ", ".join(inv_ok))
+if inv_fb and HAVE_INVESTING:
+    print("  Investing falló (respaldo Yahoo): " + ", ".join(inv_fb))
+if failed:
+    print("  Sin datos: " + ", ".join(failed))
 
 
-def fetch_yf_single(ticker, start, end):
-    try:
-        b = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
-                        end=(end + timedelta(days=2)).strftime("%Y-%m-%d"),
-                        auto_adjust=False, group_by="ticker", threads=False, progress=False)
-        return _extract(_df_for(b, ticker))
-    except Exception:
-        return None, None
-
-
-# ----------------------------- Conversion a arrays ----------------------------
-def to_arrays(s):
-    ts, vs = [], []
-    if s is None:
-        return ts, vs
-    for idx, val in s.items():
-        if pd.isna(val):
-            continue
-        d = idx.date() if hasattr(idx, "date") else idx
-        sec = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
-        ts.append(sec)
-        vs.append(round(float(val), 4))
-    return ts, vs
-
-
-# ----------------------------- Descarga total ---------------------------------
-def download_all():
-    start = date.today() - timedelta(days=PERIOD_DAYS)
-    end = date.today()
-    DATA, bull, failed = {}, {}, []
-
-    # 1) yfinance en lote para todo lo que no es Investing
-    non_inv = [t for t in ALL if t not in INVESTING_TICKERS]
-    print(f"Descargando {len(non_inv)} instrumentos por yfinance...")
-    batch = yf.download(non_inv, start=start.strftime("%Y-%m-%d"),
-                        end=(end + timedelta(days=2)).strftime("%Y-%m-%d"),
-                        auto_adjust=False, group_by="ticker", threads=True, progress=False)
-    for t in non_inv:
-        adj, close = _extract(_df_for(batch, t))
-        if adj is None:
-            failed.append(t); continue
-        ta, av = to_arrays(adj); tc, cv = to_arrays(close)
-        DATA[t] = {"ta": ta, "adj": av, "tc": tc, "close": cv}
-        bull[t] = adj
-
-    # 2) Investing (primario) con respaldo yfinance
-    print("Descargando IPSA / Dollar Index / USD/CLP / Cobre por Investing...")
-    for t in INVESTING_TICKERS:
-        s = fetch_investing(t, start, end)
-        src = "investing"
-        if s is None or len(s) < INVESTING_MIN_ROWS:
-            adj, close = fetch_yf_single(t, start, end)
-            src = "yfinance (respaldo)"
+# ----------------------------- Bullets (semanal) -----------------------------
+def asof(arr_t, arr_v, target):
+    lo, hi, a = 0, len(arr_t) - 1, -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if arr_t[mid] <= target:
+            a = mid; lo = mid + 1
         else:
-            adj = close = s
-        if adj is None:
-            failed.append(t)
-            print(f"  {t:<12} [!] sin datos")
-            continue
-        ta, av = to_arrays(adj); tc, cv = to_arrays(close)
-        DATA[t] = {"ta": ta, "adj": av, "tc": tc, "close": cv}
-        bull[t] = adj
-        print(f"  {t:<12} [ok] {len(av):4d} filas ({src})")
-
-    return DATA, bull, failed
+            hi = mid - 1
+    return arr_v[a] if a >= 0 else None
 
 
-# ----------------------------- Bullets de mercado -----------------------------
-def safe_ret(p1, p0):
-    if p1 is None or p0 is None or p0 == 0:
+def wk_ret(data, tk, use_close=False):
+    d = data.get(tk)
+    if not d or not d.get("ta"):
         return None
-    return p1 / p0 - 1.0
+    lf, pf = last_friday(), last_friday() - timedelta(weeks=1)
+    tarr = d["tc"] if use_close else d["ta"]
+    varr = d["close"] if use_close else d["adj"]
+    p1 = asof(tarr, varr, to_sec(lf))
+    p0 = asof(tarr, varr, to_sec(pf))
+    if p1 is None or not p0:
+        return None
+    return p1 / p0 - 1
 
 
-def build_bullets(bull, last_fri, prev_fri):
-    def aprice(s, d):
-        if s is None or len(s) == 0:
-            return None
-        v = s.asof(pd.Timestamp(d))
-        if v is None or (isinstance(v, float) and np.isnan(v)):
-            return None
-        return float(v)
-
-    def wret(name):
-        return safe_ret(aprice(bull.get(name), last_fri), aprice(bull.get(name), prev_fri))
-
-    bullets = []
-
-    # Bullet 1: mercados desarrollados y emergentes
-    ret_dm, ret_em = wret("URTH"), wret("EEM")
-    if ret_dm is not None and ret_em is not None:
-        if ret_dm > 0 and ret_em > 0:
-            tono, verbo = "positivos", "impulsados"
-        elif ret_dm < 0 and ret_em < 0:
-            tono, verbo = "negativos", "marcados"
+def build_bullets(data):
+    bl = []
+    dm, em = wk_ret(data, "URTH"), wk_ret(data, "EEM")
+    if dm is not None and em is not None:
+        if dm > 0 and em > 0:
+            tono = "positivos"
+        elif dm < 0 and em < 0:
+            tono = "negativos"
         else:
-            tono, verbo = "mixtos", "influenciados"
-        bullets.append(
-            f"Semana con retornos {tono} en mercados desarrollados y emergentes, {verbo} por …"
-        )
+            tono = "mixtos"
+        bl.append(f"Semana con retornos {tono} en mercados desarrollados "
+                  f"({dm*100:+.2f}%) y emergentes ({em*100:+.2f}%).")
 
-    # Bullet 2: forex, dolar y cobre
-    usdclp_ret, dxy_ret, cobre_ret = wret("USDCLP=X"), wret("DX-Y.NYB"), wret("HG=F")
-    if usdclp_ret is not None:
-        p1, p0 = aprice(bull.get("USDCLP=X"), last_fri), aprice(bull.get("USDCLP=X"), prev_fri)
-        var_pesos = abs(round(p1 - p0, 0)) if (p1 and p0) else abs(round(usdclp_ret * 900, 0))
-        mov_peso = "depreció" if usdclp_ret > 0 else "apreció"
-        efecto = "un aumento" if usdclp_ret > 0 else "una disminución"
-        peso_dep = usdclp_ret > 0
-
+    usdclp = wk_ret(data, "USDCLP=X", use_close=True)
+    dxy = wk_ret(data, "DX-Y.NYB", use_close=True)
+    cobre = wk_ret(data, "HG=F", use_close=True)
+    if usdclp is not None:
+        d = data.get("USDCLP=X")
+        lf, pf = last_friday(), last_friday() - timedelta(weeks=1)
+        p1 = asof(d["tc"], d["close"], to_sec(lf))
+        p0 = asof(d["tc"], d["close"], to_sec(pf))
+        var_pesos = abs(round(p1 - p0)) if (p1 and p0) else abs(round(usdclp * 900))
+        mov_peso = "depreció" if usdclp > 0 else "apreció"
+        efecto = "un aumento" if usdclp > 0 else "una disminución"
+        peso_dep = usdclp > 0
         en_linea, pese_a = [], []
-        if dxy_ret is not None:
-            dxy_sube = dxy_ret > 0
-            txt = (f"la {'apreciación' if dxy_sube else 'depreciación'} de "
-                   f"{abs(dxy_ret*100):.2f}% del dólar a nivel internacional")
+        if dxy is not None:
+            dxy_sube = dxy > 0
+            mov_dolar = "apreciación" if dxy_sube else "depreciación"
+            txt = f"la {mov_dolar} de {abs(dxy*100):.2f}% del dólar a nivel internacional"
             (en_linea if peso_dep == dxy_sube else pese_a).append(txt)
-        if cobre_ret is not None:
-            consistente = (peso_dep and cobre_ret < 0) or (not peso_dep and cobre_ret > 0)
-            art = "el" if cobre_ret > 0 else "la"
-            mov = "alza" if cobre_ret > 0 else "caída"
-            txt = f"{art} {mov} de {abs(cobre_ret*100):.2f}% en el precio del cobre"
-            (en_linea if consistente else pese_a).append(txt)
-
-        sufijos = []
+        if cobre is not None:
+            cons = (peso_dep and cobre < 0) or ((not peso_dep) and cobre > 0)
+            mov_c = "alza" if cobre > 0 else "caída"
+            art = "el" if cobre > 0 else "la"
+            txt = f"{art} {mov_c} de {abs(cobre*100):.2f}% en el precio del cobre"
+            (en_linea if cons else pese_a).append(txt)
+        suf = []
         if en_linea:
-            sufijos.append("en línea con " + " y ".join(en_linea))
+            suf.append("en línea con " + " y ".join(en_linea))
         if pese_a:
-            sufijos.append("en desacople con " + " y ".join(pese_a))
+            suf.append("en desacople con " + " y ".join(pese_a))
+        var_str = f"{var_pesos:,.0f}".replace(",", ".")
+        b = (f"Por el lado del Forex, el peso chileno se {mov_peso} un {abs(usdclp*100):.2f}%, "
+             f"equivalente a {efecto} de alrededor de {var_str} pesos")
+        if suf:
+            b += ", " + ", ".join(suf)
+        bl.append(b + ".")
+    return bl
 
-        b = (f"Por el lado del Forex, el peso chileno se {mov_peso} un {abs(usdclp_ret*100):.2f}%, "
-             f"lo que equivale a {efecto} de alrededor de {var_pesos:,.0f} pesos")
-        if sufijos:
-            b += ", " + ", ".join(sufijos)
-        bullets.append(b + ".")
 
-    return bullets
+bullets = build_bullets(DATA)
+lf = last_friday()
+if bullets:
+    items = "".join(f"<li>{b}</li>" for b in bullets)
+    COMENTARIO = (f'<div class="coment"><h2>Comentario de mercado · semana al '
+                  f'{lf.strftime("%d-%m-%Y")}</h2><ul>{items}</ul></div>')
+else:
+    COMENTARIO = ""
 
 
 # ----------------------------- Plantilla HTML ---------------------------------
@@ -344,9 +334,10 @@ td.name .tk{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11
 .sub{font-size:10px;color:#94a3b8}
 .pos{color:#059669}.neg{color:#e11d48}.zero{color:#94a3b8}.na{color:#cbd5e1}
 tbody tr:hover td{background:#f8fafc}
-.bullets{padding:14px 20px;border-top:1px solid #e2e8f0}
-.bullets .bt{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#64748b;font-weight:600;margin-bottom:6px}
-.bullets p{margin:6px 0;font-size:13px;color:#334155;line-height:1.55}
+.coment{padding:16px 20px;border-top:1px solid #e2e8f0;background:#fff}
+.coment h2{font-size:13px;margin:0 0 8px;color:#0f172a;font-weight:600}
+.coment ul{margin:0;padding-left:18px}
+.coment li{font-size:13px;color:#334155;line-height:1.6;margin:4px 0}
 .foot{padding:12px 20px;border-top:1px solid #e2e8f0;background:#f8fafc;font-size:11px;color:#94a3b8;line-height:1.6}
 .foot b{color:#64748b;font-weight:600}
 .foot div{margin:1px 0}
@@ -371,80 +362,72 @@ tbody tr:hover td{background:#f8fafc}
     </tr></thead>
     <tbody id="tbody"></tbody>
   </table></div>
-  <div class="bullets" id="bullets"></div>
+  <!--COMENTARIO-->
   <div class="foot">
     <div><b>*</b> 3a y 5a anualizados. <b>Sem.</b> = último viernes vs. viernes previo. <b>MTD/YTD</b> desde el último cierre del mes/año anterior.</div>
-    <div>Vista CLP (aditiva): <b>retorno USD + variación USD/CLP</b> del período. IPSA, Dollar Index, Cobre y USD/CLP se muestran sin ajuste de tipo de cambio.</div>
-    <div>Retornos de ETFs sobre precio ajustado (dividendos reinvertidos). Fuentes: IPSA/Dollar Index/USD/CLP/Cobre vía Investing.com (respaldo yfinance); resto vía yfinance.</div>
+    <div>Conversión a CLP por <b>método aditivo</b>: retorno en USD + variación del USD/CLP del período. ETFs sobre precio ajustado (total return).</div>
+    <div>IPSA, Dollar Index, USD/CLP y Cobre desde <b>Investing.com</b> (resto desde Yahoo Finance). IPSA es nativo en CLP y no se ajusta por tipo de cambio.</div>
   </div>
 </div>
 <script>
 const GROUPS = /*GROUPS*/;
 const DATA = /*DATA*/;
-const BULLETS = /*BULLETS*/;
 
-const UT = (DATA["USDCLP=X"] || {}).tc || [];
-const UV = (DATA["USDCLP=X"] || {}).close || [];
+const FXC = DATA["USDCLP=X"] || {};
+const FXT = FXC.tc || [];
+const FXV = FXC.close || [];
 
 function idxBefore(t,x){let lo=0,hi=t.length-1,a=-1;while(lo<=hi){const m=(lo+hi)>>1;if(t[m]<=x){a=m;lo=m+1;}else hi=m-1;}return a;}
 function idxAfter(t,x){let lo=0,hi=t.length-1,a=-1;while(lo<=hi){const m=(lo+hi)>>1;if(t[m]>=x){a=m;hi=m-1;}else lo=m+1;}return a;}
-function asof(t,v,sec){const i=idxBefore(t,sec);return i<0?null:v[i];}
-function fxAsof(sec){return asof(UT,UV,sec);}
-function ret(a,b){return (a==null||b==null||!isFinite(a)||!isFinite(b)||b===0)?null:a/b-1;}
+function usdAt(sec){if(!FXT.length)return null;let i=idxBefore(FXT,sec);if(i<0)i=0;return FXV[i];}
+
 const YR = 365.25*86400;
-
-function calc(item, cur, cs, ce){
-  const d = DATA[item.t];
-  const out = {m:{}, last:null};
-  if(!d) return out;
-  const lc  = d.close.length ? d.close[d.close.length-1] : null;
-  const lcT = d.tc.length    ? d.tc[d.tc.length-1]       : null;
-  if(cur==="CLP" && !item.native && !item.clp){
-    const f = (lcT!=null)?fxAsof(lcT):null;
-    out.last = (lc!=null && f)? lc*f : null;
-  } else {
-    out.last = lc;
-  }
-  if(!d.ta || d.ta.length<2) return out;
-  const t=d.ta, v=d.adj, n=t.length-1, lastV=v[n], lastT=t[n];
-  const D=new Date(lastT*1000), Y=D.getUTCFullYear(), M=D.getUTCMonth(), DD=D.getUTCDate();
-  const needFx = (cur==="CLP") && !item.native && !item.clp;
-  const m = out.m;
-
-  function periodTo(startSec){
-    const nat = ret(lastV, asof(t,v,startSec));
-    if(nat==null) return null;
-    if(!needFx) return nat;
-    const f = ret(fxAsof(lastT), fxAsof(startSec));
-    return (f==null)?nat:nat+f;
-  }
-
-  const fri=[]; for(let i=0;i<t.length;i++){ if(new Date(t[i]*1000).getUTCDay()===5) fri.push(i); }
-  if(fri.length>=2){
-    const a=fri[fri.length-1], b=fri[fri.length-2];
-    let r=ret(v[a],v[b]);
-    if(r!=null){ if(needFx){ const f=ret(fxAsof(t[a]),fxAsof(t[b])); if(f!=null) r+=f; } m.wk=r; }
-  }
-  m.mtd=periodTo(Date.UTC(Y,M,0)/1000);
-  m.ytd=periodTo(Date.UTC(Y,0,0)/1000);
-  m.y1 =periodTo(Date.UTC(Y-1,M,DD)/1000);
-  const s3=Date.UTC(Y-3,M,DD)/1000, i3=idxBefore(t,s3);
-  if(i3>=0){ const c=periodTo(s3); if(c!=null){ const yrs=(lastT-t[i3])/YR; if(yrs>0) m.y3=Math.pow(1+c,1/yrs)-1; } }
-  const s5=Date.UTC(Y-5,M,DD)/1000, i5=idxBefore(t,s5);
-  if(i5>=0){ const c=periodTo(s5); if(c!=null){ const yrs=(lastT-t[i5])/YR; if(yrs>0) m.y5=Math.pow(1+c,1/yrs)-1; } }
-
-  if(cs&&ce&&ce>cs){
+function rawMetrics(t, v, cs, ce){
+  const m = {};
+  if(!t || t.length<2) return m;
+  const n = t.length-1, lastV = v[n], lastT = t[n];
+  const D = new Date(lastT*1000), Y=D.getUTCFullYear(), M=D.getUTCMonth(), DD=D.getUTCDate();
+  const at = (s)=>{const i=idxBefore(t,s);return i<0?null:v[i];};
+  const rr = (a,b)=>(a==null||b==null||!isFinite(a)||!isFinite(b)||b===0)?null:a/b-1;
+  const fri = [];
+  for(let i=0;i<t.length;i++){ if(new Date(t[i]*1000).getUTCDay()===5) fri.push(i); }
+  m.wk  = fri.length>=2 ? rr(v[fri[fri.length-1]], v[fri[fri.length-2]]) : null;
+  m.mtd = rr(lastV, at(Date.UTC(Y,M,0)/1000));
+  m.ytd = rr(lastV, at(Date.UTC(Y,0,0)/1000));
+  m.y1  = rr(lastV, at(Date.UTC(Y-1,M,DD)/1000));
+  const i3 = idxBefore(t, Date.UTC(Y-3,M,DD)/1000);
+  if(i3>=0){ m.y3c = rr(lastV, v[i3]); m.y3y = (lastT-t[i3])/YR; }
+  const i5 = idxBefore(t, Date.UTC(Y-5,M,DD)/1000);
+  if(i5>=0){ m.y5c = rr(lastV, v[i5]); m.y5y = (lastT-t[i5])/YR; }
+  if(cs && ce && ce>cs){
     const si=idxAfter(t,cs), ei=idxBefore(t,ce);
-    if(si>=0&&ei>=0&&t[ei]>t[si]){
-      let cum=ret(v[ei],v[si]);
-      if(cum!=null){
-        if(needFx){ const f=ret(fxAsof(t[ei]),fxAsof(t[si])); if(f!=null) cum+=f; }
-        m.cum=cum;
-        const yrs=(t[ei]-t[si])/YR; m.cumAnn = (yrs>=1)?Math.pow(1+cum,1/yrs)-1:null;
-      }
-    }
+    if(si>=0 && ei>=0 && t[ei]>t[si]){ m.cumc = v[ei]/v[si]-1; m.cumy = (t[ei]-t[si])/YR; }
   }
-  return out;
+  return m;
+}
+const add = (a,b)=>(a==null||b==null)?null:a+b;
+const ann = (c,y)=>(c==null||y==null||y<=0)?null:Math.pow(1+c,1/y)-1;
+function combine(u,f){return{wk:add(u.wk,f.wk),mtd:add(u.mtd,f.mtd),ytd:add(u.ytd,f.ytd),y1:add(u.y1,f.y1),y3c:add(u.y3c,f.y3c),y3y:u.y3y,y5c:add(u.y5c,f.y5c),y5y:u.y5y,cumc:add(u.cumc,f.cumc),cumy:u.cumy};}
+function display(m){return{wk:m.wk,mtd:m.mtd,ytd:m.ytd,y1:m.y1,y3:ann(m.y3c,m.y3y),y5:ann(m.y5c,m.y5y),cum:m.cumc,cumAnn:(m.cumy!=null&&m.cumy>=1)?ann(m.cumc,m.cumy):null};}
+
+function lastValue(it, cur){
+  const d = DATA[it.t];
+  if(!d || !d.close || !d.close.length) return null;
+  const lc = d.close[d.close.length-1], lct = d.tc[d.tc.length-1];
+  if(it.native || it.clp) return lc;        // Dólar/Cobre nativo, IPSA en pesos
+  if(cur==="USD") return lc;
+  const u = usdAt(lct); return u ? lc*u : null;
+}
+
+let fxRaw = null;
+function rowMetrics(it, cur, cs, ce){
+  const d = DATA[it.t];
+  if(!d || !d.ta || !d.ta.length) return {};
+  const usd = rawMetrics(d.ta, d.adj, cs, ce);
+  if(it.native || it.clp) return display(usd);   // sin ajuste FX
+  if(cur==="USD") return display(usd);
+  if(!FXV.length) return display(usd);
+  return display(combine(usd, fxRaw));           // CLP = USD + variación USD/CLP
 }
 
 const nf = new Intl.NumberFormat("es-CL",{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -464,11 +447,13 @@ function render(){
   const cur = state.cur;
   const cs = parseDate(startEl.value, false);
   const ce = parseDate(endEl.value, true);
+  fxRaw = rawMetrics(FXT, FXV, cs, ce);
   let html = "";
   for(const g of GROUPS){
     html += '<tr class="grp"><td colspan="9">'+g.label+'</td></tr>';
     for(const it of g.items){
-      const {m,last} = calc(it, cur, cs, ce);
+      const m = rowMetrics(it, cur, cs, ce);
+      const last = lastValue(it, cur);
       const tags = (it.native&&it.u?" · "+it.u:"") + (it.clp?" · CLP":"");
       const cells = KEYS.map(k=>'<td class="num '+pctCls(m[k])+'">'+fmtPct(m[k])+'</td>').join("");
       const sub = (m.cumAnn!=null)?'<div class="sub">anualiz. '+fmtPct(m.cumAnn)+'</div>':"";
@@ -493,12 +478,6 @@ function render(){
   endEl.max = iso(Ld);
   startEl.value = Ld.getUTCFullYear()+"-01-01";
   document.getElementById("asof").textContent = Ld.toLocaleDateString("es-CL",{day:"2-digit",month:"2-digit",year:"numeric"});
-
-  const bx = document.getElementById("bullets");
-  if(BULLETS && BULLETS.length){
-    bx.innerHTML = '<div class="bt">Comentario de mercado (semana)</div>' + BULLETS.map(b=>'<p>• '+b+'</p>').join('');
-  } else { bx.style.display = "none"; }
-
   document.querySelectorAll(".seg").forEach(btn=>btn.addEventListener("click",()=>{
     state.cur = btn.dataset.c;
     document.querySelectorAll(".seg").forEach(x=>x.classList.toggle("on", x===btn));
@@ -512,34 +491,19 @@ function render(){
 </body>
 </html>'''
 
+# ----------------------------- Escritura ---------------------------------------
+out = (HTML_TEMPLATE
+       .replace("/*GROUPS*/", json.dumps(GROUPS, ensure_ascii=False))
+       .replace("/*DATA*/", json.dumps(DATA))
+       .replace("<!--COMENTARIO-->", COMENTARIO)
+       .replace("__GENERATED__", datetime.now().strftime("%d-%m-%Y %H:%M")))
 
-# ----------------------------- Main -------------------------------------------
-def main():
-    DATA, bull, failed = download_all()
+fname = "panel_rentabilidades.html"
+with open(fname, "w", encoding="utf-8") as f:
+    f.write(out)
 
-    today = date.today()
-    days_back = (today.weekday() - 4) % 7
-    last_fri = today - timedelta(days=days_back)
-    prev_fri = last_fri - timedelta(weeks=1)
-    bullets = build_bullets(bull, last_fri, prev_fri)
-
-    print("\nBullets generados:")
+print(f"\nListo. Archivo generado: {fname}")
+if bullets:
+    print("Comentario semanal:")
     for b in bullets:
-        print(f"  • {b}")
-    if failed:
-        print("\n  Sin datos: " + ", ".join(failed))
-
-    out = (HTML_TEMPLATE
-           .replace("/*GROUPS*/", json.dumps(GROUPS, ensure_ascii=False))
-           .replace("/*DATA*/", json.dumps(DATA))
-           .replace("/*BULLETS*/", json.dumps(bullets, ensure_ascii=False))
-           .replace("__GENERATED__", datetime.now().strftime("%d-%m-%Y %H:%M")))
-
-    fname = "panel_rentabilidades.html"
-    with open(fname, "w", encoding="utf-8") as f:
-        f.write(out)
-    print(f"\nListo. Archivo generado: {fname}")
-
-
-if __name__ == "__main__":
-    main()
+        print("  • " + b)
